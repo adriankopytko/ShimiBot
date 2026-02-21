@@ -89,8 +89,7 @@ func main() {
 			fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
 			os.Exit(1)
 		}
-
-		fmt.Print(content)
+		fmt.Print(string(content))
 	}
 
 	// You can use print statements as follows for debugging, they'll be visible when running tests.
