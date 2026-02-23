@@ -93,14 +93,37 @@ func handleToolCall(toolCall openai.ChatCompletionMessageToolCallUnion) string {
 	tool_name := toolCall.Function.Name
 
 	if tool_name == "Read" {
-		content := readFileContent(toolCall)
-		return string(content)
+		return readFileContent(toolCall)
+	}
+
+	if tool_name == "Write" {
+		return writeFileContent(toolCall)
 	}
 
 	return ""
 }
 
-func readFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) []byte {
+func writeFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) string {
+	var args map[string]interface{}
+
+	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
+		os.Exit(1)
+	}
+
+	err = os.WriteFile(args["file_path"].(string), []byte(args["content"].(string)), 0644)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error writing file: %v\n", err)
+		os.Exit(1)
+	}
+
+	return args["content"].(string)
+}
+
+func readFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) string {
 	var args map[string]interface{}
 
 	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
@@ -116,7 +139,7 @@ func readFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) []byte 
 		fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
 		os.Exit(1)
 	}
-	return content
+	return string(content)
 }
 
 func generateChatCompletion(client openai.Client, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletion, error) {
@@ -137,6 +160,24 @@ func generateChatCompletion(client openai.Client, messages []openai.ChatCompleti
 							},
 						},
 						"required": []string{"file_path"},
+					},
+				}),
+				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
+					Name:        "Write",
+					Description: openai.String("Write content to a file"),
+					Parameters: openai.FunctionParameters{
+						"type": "object",
+						"properties": map[string]any{
+							"file_path": map[string]any{
+								"type":        "string",
+								"description": "The path to the file to write to",
+							},
+							"content": map[string]any{
+								"type":        "string",
+								"description": "The content to write to the file",
+							},
+						},
+						"required": []string{"file_path", "content"},
 					},
 				}),
 			},
