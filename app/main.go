@@ -61,7 +61,7 @@ func main() {
 			},
 		})
 
-		if resp.Choices[0].FinishReason == "stop" && len(message.ToolCalls) == 0 {
+		if resp.Choices[0].FinishReason == "stop" || len(message.ToolCalls) == 0 {
 			break
 		}
 
