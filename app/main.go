@@ -31,18 +31,99 @@ func main() {
 	}
 
 	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseUrl))
+	messageHistory := []openai.ChatCompletionMessageParamUnion{}
+	messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
+		OfUser: &openai.ChatCompletionUserMessageParam{
+			Content: openai.ChatCompletionUserMessageParamContentUnion{
+				OfString: openai.String(prompt),
+			},
+		},
+	})
+
+	for {
+		resp, err := generateChatCompletion(client, messageHistory)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		if len(resp.Choices) == 0 {
+			panic("No choices in response")
+		}
+
+		message := resp.Choices[0].Message
+
+		messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
+			OfAssistant: &openai.ChatCompletionAssistantMessageParam{
+				Content: openai.ChatCompletionAssistantMessageParamContentUnion{
+					OfString: message.ToAssistantMessageParam().Content.OfString,
+				},
+				ToolCalls: message.ToAssistantMessageParam().ToolCalls,
+			},
+		})
+
+		if resp.Choices[0].FinishReason == "stop" && len(message.ToolCalls) == 0 {
+			break
+		}
+
+		if len(message.ToolCalls) > 0 {
+			for _, toolCall := range message.ToolCalls {
+				toolResponse := handleToolCall(toolCall)
+				messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
+					OfTool: &openai.ChatCompletionToolMessageParam{
+						Role: "tool",
+						Content: openai.ChatCompletionToolMessageParamContentUnion{
+							OfString: openai.String(toolResponse),
+						},
+						ToolCallID: toolCall.ID,
+					},
+				})
+			}
+		}
+	}
+
+	// You can use print statements as follows for debugging, they'll be visible when running tests.
+	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
+
+	fmt.Print(messageHistory[len(messageHistory)-1].OfAssistant.Content.OfString)
+
+	os.Exit(0)
+}
+
+func handleToolCall(toolCall openai.ChatCompletionMessageToolCallUnion) string {
+	tool_name := toolCall.Function.Name
+
+	if tool_name == "Read" {
+		content := readFileContent(toolCall)
+		return string(content)
+	}
+
+	return ""
+}
+
+func readFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) []byte {
+	var args map[string]interface{}
+
+	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
+		os.Exit(1)
+	}
+
+	content, err := os.ReadFile(args["file_path"].(string))
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
+		os.Exit(1)
+	}
+	return content
+}
+
+func generateChatCompletion(client openai.Client, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletion, error) {
 	resp, err := client.Chat.Completions.New(context.Background(),
 		openai.ChatCompletionNewParams{
-			Model: "anthropic/claude-haiku-4.5",
-			Messages: []openai.ChatCompletionMessageParamUnion{
-				{
-					OfUser: &openai.ChatCompletionUserMessageParam{
-						Content: openai.ChatCompletionUserMessageParamContentUnion{
-							OfString: openai.String(prompt),
-						},
-					},
-				},
-			},
+			Model:    "anthropic/claude-haiku-4.5",
+			Messages: messages,
 			Tools: []openai.ChatCompletionToolUnionParam{
 				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
 					Name:        "Read",
@@ -61,42 +142,5 @@ func main() {
 			},
 		},
 	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
-	}
-	if len(resp.Choices) == 0 {
-		panic("No choices in response")
-	}
-
-	if len(resp.Choices[0].Message.ToolCalls) > 0 {
-		tool_call := resp.Choices[0].Message.ToolCalls[0]
-
-		tool_name := tool_call.Function.Name
-
-		if tool_name == "Read" {
-			var args map[string]interface{}
-
-			err := json.Unmarshal([]byte(tool_call.Function.Arguments), &args)
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
-				os.Exit(1)
-			}
-
-			content, err := os.ReadFile(args["file_path"].(string))
-
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
-				os.Exit(1)
-			}
-			fmt.Print(string(content))
-		}
-	}
-
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
-
-	// TODO: Uncomment the line below to pass the first stage
-	fmt.Print(resp.Choices[0].Message.Content)
+	return resp, err
 }
