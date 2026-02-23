@@ -120,7 +120,7 @@ func executeBashCommand(toolCall openai.ChatCompletionMessageToolCallUnion) stri
 
 	cmd := args["command"].(string)
 
-	output, err := exec.Command(cmd).CombinedOutput()
+	output, err := exec.Command("bash", "-c", cmd).CombinedOutput()
 
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error executing bash command: %v\n", err)
