@@ -2,227 +2,169 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
+	"strings"
+	"time"
 
-	"github.com/openai/openai-go/v3"
-	"github.com/openai/openai-go/v3/option"
+	"github.com/adriankopytko/ShimiBot/internal/appcore"
+	"github.com/adriankopytko/ShimiBot/internal/agent"
+	"github.com/adriankopytko/ShimiBot/internal/cli"
+	"github.com/adriankopytko/ShimiBot/internal/llm"
+	"github.com/adriankopytko/ShimiBot/internal/session"
+	"github.com/adriankopytko/ShimiBot/internal/tools"
 )
 
 func main() {
-	var prompt string
-	flag.StringVar(&prompt, "p", "", "Prompt to send to LLM")
-	flag.Parse()
+	appcore.LoadEnvFilesIfPresent([]string{".env", "app/.env"}, appcore.Logger{})
 
-	if prompt == "" {
-		panic("Prompt must not be empty")
+	cliConfig, err := cli.ParseConfig()
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			os.Exit(0)
+		}
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
 	}
 
-	apiKey := os.Getenv("OPENROUTER_API_KEY")
-	baseUrl := os.Getenv("OPENROUTER_BASE_URL")
-	if baseUrl == "" {
-		baseUrl = "https://openrouter.ai/api/v1"
-	}
-
-	if apiKey == "" {
-		panic("Env variable OPENROUTER_API_KEY not found")
-	}
-
-	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(baseUrl))
-	messageHistory := []openai.ChatCompletionMessageParamUnion{}
-	messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
-		OfUser: &openai.ChatCompletionUserMessageParam{
-			Content: openai.ChatCompletionUserMessageParamContentUnion{
-				OfString: openai.String(prompt),
-			},
-		},
+	appLogger, err := appcore.NewLogger(cliConfig.LogEnabled, cliConfig.LogLevel, appcore.LoggerSinkConfig{
+		Sink:     cliConfig.LogSink,
+		FilePath: cliConfig.LogFile,
 	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(2)
+	}
+	appLogger.Infof("startup complete (log_enabled=%t, log_level=%s, log_sink=%s)", cliConfig.LogEnabled, strings.ToLower(cliConfig.LogLevel), strings.ToLower(cliConfig.LogSink))
 
-	for {
-		resp, err := generateChatCompletion(client, messageHistory)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+	if strings.TrimSpace(cliConfig.Prompt) == "" && !cliConfig.Interactive {
+		cliConfig.Interactive = true
+	}
+
+	if cliConfig.Interactive && strings.TrimSpace(cliConfig.SessionID) == "" {
+		cliConfig.SessionID = session.DefaultSessionID(time.Now())
+		appLogger.Infof("created session id=%s", cliConfig.SessionID)
+	}
+
+	sessionStore := session.NewJSONFileStore()
+
+	llmConfig, err := appcore.ResolveLLMConfig(appLogger)
+	if err != nil {
+		appLogger.Errorf("failed resolving llm config: %v", err)
+		panic(err.Error())
+	}
+	toolRegistry := tools.DefaultRegistry()
+	appLogger.Infof("using provider=%s model=%s base_url=%s", llmConfig.Provider, llmConfig.Model, llmConfig.BaseURL)
+
+	workingDir, wdErr := os.Getwd()
+	if wdErr != nil {
+		appLogger.Warnf("failed to get working directory: %v", wdErr)
+		workingDir = "."
+	}
+	toolContext := tools.ToolContext{
+		CWD:         workingDir,
+		AllowedRoot: workingDir,
+		Timeout:     cliConfig.ToolTimeout,
+		Logger:      appLogger,
+	}
+
+	llmClient := llm.NewOpenAIClient(llmConfig.APIKey, llmConfig.BaseURL)
+	agentRunner := agent.Runner{
+		LLMClient:       llmClient,
+		Model:           llmConfig.Model,
+		ToolDefinitions: toolRegistry.Definitions(),
+		ExecuteTool: func(ctx context.Context, correlationID string, toolCall llm.ToolCall) string {
+			turnToolContext := toolContext
+			turnToolContext.Context = ctx
+			turnToolContext.CorrelationID = correlationID
+			return appcore.DispatchToolCall(appLogger, toolRegistry, turnToolContext, toolCall)
+		},
+		Logger: appLogger,
+		Policy: agent.Policy{
+			MaxTurns:     cliConfig.MaxTurns,
+			MaxToolCalls: cliConfig.MaxToolCalls,
+		},
+	}
+
+	messageHistory, err := sessionStore.Load(cliConfig.SessionID)
+	if err != nil {
+		appLogger.Errorf("failed loading session history: %v", err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+
+	if len(messageHistory) == 0 {
+		systemPrompt := appcore.BuildSystemPrompt(time.Now())
+		messageHistory = append(messageHistory, llm.Message{
+			Role:    llm.RoleSystem,
+			Content: systemPrompt,
+		})
+		appLogger.Debugf("system prompt initialized with current date")
+	}
+
+	runAgentTurn := func(prompt string) (string, error) {
+		correlationID := appcore.NewCorrelationID()
+		appLogger.Infof("event=turn_request correlation_id=%s prompt_chars=%d", correlationID, len(prompt))
+
+		turnCtx, cancel := context.WithTimeout(context.Background(), cliConfig.TurnTimeout)
+		defer cancel()
+
+		responseText, runErr := agentRunner.RunPrompt(turnCtx, &messageHistory, prompt, correlationID)
+		if runErr != nil {
+			appLogger.Errorf("event=turn_error correlation_id=%s err=%v", correlationID, runErr)
+			return "", runErr
+		}
+
+		appLogger.Infof("event=turn_complete correlation_id=%s response_chars=%d", correlationID, len(responseText))
+		return responseText, nil
+	}
+
+	if strings.TrimSpace(cliConfig.Prompt) != "" {
+		appLogger.Debugf("received prompt with %d characters", len(cliConfig.Prompt))
+		responseText, runErr := runAgentTurn(cliConfig.Prompt)
+		if runErr != nil {
+			appLogger.Errorf("prompt run failed: %v", runErr)
+			fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
 			os.Exit(1)
 		}
-		if len(resp.Choices) == 0 {
-			panic("No choices in response")
-		}
-
-		message := resp.Choices[0].Message
-
-		messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
-			OfAssistant: &openai.ChatCompletionAssistantMessageParam{
-				Content: openai.ChatCompletionAssistantMessageParamContentUnion{
-					OfString: message.ToAssistantMessageParam().Content.OfString,
-				},
-				ToolCalls: message.ToAssistantMessageParam().ToolCalls,
-			},
-		})
-
-		if resp.Choices[0].FinishReason == "stop" || len(message.ToolCalls) == 0 {
-			break
-		}
-
-		if len(message.ToolCalls) > 0 {
-			for _, toolCall := range message.ToolCalls {
-				toolResponse := handleToolCall(toolCall)
-				messageHistory = append(messageHistory, openai.ChatCompletionMessageParamUnion{
-					OfTool: &openai.ChatCompletionToolMessageParam{
-						Role: "tool",
-						Content: openai.ChatCompletionToolMessageParamContentUnion{
-							OfString: openai.String(toolResponse),
-						},
-						ToolCallID: toolCall.ID,
-					},
-				})
+		if strings.TrimSpace(cliConfig.SessionID) != "" {
+			if saveErr := sessionStore.Save(cliConfig.SessionID, messageHistory); saveErr != nil {
+				appLogger.Errorf("failed saving session history: %v", saveErr)
+				fmt.Fprintf(os.Stderr, "warning: failed saving session history: %v\n", saveErr)
 			}
 		}
+		fmt.Print(responseText)
+		if !cliConfig.Interactive {
+			os.Exit(0)
+		}
+		fmt.Println()
 	}
 
-	// You can use print statements as follows for debugging, they'll be visible when running tests.
-	fmt.Fprintln(os.Stderr, "Logs from your program will appear here!")
+	if cliConfig.Interactive {
+		runErr := cli.RunInteractive(cliConfig.SessionID, func(input string) (string, error) {
+			responseText, promptErr := runAgentTurn(input)
+			if promptErr != nil {
+				appLogger.Errorf("interactive prompt failed: %v", promptErr)
+				return "", promptErr
+			}
 
-	fmt.Print(messageHistory[len(messageHistory)-1].OfAssistant.Content.OfString)
+			if strings.TrimSpace(cliConfig.SessionID) != "" {
+				if saveErr := sessionStore.Save(cliConfig.SessionID, messageHistory); saveErr != nil {
+					appLogger.Errorf("failed saving session history: %v", saveErr)
+					fmt.Fprintf(os.Stderr, "warning: failed saving session history: %v\n", saveErr)
+				}
+			}
+
+			return responseText, nil
+		})
+		if runErr != nil {
+			appLogger.Errorf("interactive input failed: %v", runErr)
+			fmt.Fprintf(os.Stderr, "error: %v\n", runErr)
+			os.Exit(1)
+		}
+	}
 
 	os.Exit(0)
-}
-
-func handleToolCall(toolCall openai.ChatCompletionMessageToolCallUnion) string {
-	tool_name := toolCall.Function.Name
-
-	if tool_name == "Read" {
-		return readFileContent(toolCall)
-	}
-
-	if tool_name == "Write" {
-		return writeFileContent(toolCall)
-	}
-
-	if tool_name == "Bash" {
-		return executeBashCommand(toolCall)
-	}
-
-	return ""
-}
-
-func executeBashCommand(toolCall openai.ChatCompletionMessageToolCallUnion) string {
-	var args map[string]interface{}
-
-	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
-		os.Exit(1)
-	}
-
-	cmd := args["command"].(string)
-
-	output, err := exec.Command("bash", "-c", cmd).CombinedOutput()
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error executing bash command: %v\n", err)
-		os.Exit(1)
-	}
-
-	return string(output)
-}
-
-func writeFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) string {
-	var args map[string]interface{}
-
-	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
-		os.Exit(1)
-	}
-
-	err = os.WriteFile(args["file_path"].(string), []byte(args["content"].(string)), 0644)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error writing file: %v\n", err)
-		os.Exit(1)
-	}
-
-	return args["content"].(string)
-}
-
-func readFileContent(toolCall openai.ChatCompletionMessageToolCallUnion) string {
-	var args map[string]interface{}
-
-	err := json.Unmarshal([]byte(toolCall.Function.Arguments), &args)
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error parsing arguments: %v\n", err)
-		os.Exit(1)
-	}
-
-	content, err := os.ReadFile(args["file_path"].(string))
-
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error reading file: %v\n", err)
-		os.Exit(1)
-	}
-	return string(content)
-}
-
-func generateChatCompletion(client openai.Client, messages []openai.ChatCompletionMessageParamUnion) (*openai.ChatCompletion, error) {
-	resp, err := client.Chat.Completions.New(context.Background(),
-		openai.ChatCompletionNewParams{
-			Model:    "anthropic/claude-haiku-4.5",
-			Messages: messages,
-			Tools: []openai.ChatCompletionToolUnionParam{
-				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
-					Name:        "Read",
-					Description: openai.String("Read and return the contents of a file"),
-					Parameters: openai.FunctionParameters{
-						"type": "object",
-						"properties": map[string]any{
-							"file_path": map[string]any{
-								"type":        "string",
-								"description": "The path to the file to read",
-							},
-						},
-						"required": []string{"file_path"},
-					},
-				}),
-				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
-					Name:        "Write",
-					Description: openai.String("Write content to a file"),
-					Parameters: openai.FunctionParameters{
-						"type": "object",
-						"properties": map[string]any{
-							"file_path": map[string]any{
-								"type":        "string",
-								"description": "The path to the file to write to",
-							},
-							"content": map[string]any{
-								"type":        "string",
-								"description": "The content to write to the file",
-							},
-						},
-						"required": []string{"file_path", "content"},
-					},
-				}),
-				openai.ChatCompletionFunctionTool(openai.FunctionDefinitionParam{
-					Name:        "Bash",
-					Description: openai.String("Execute a shell command"),
-					Parameters: openai.FunctionParameters{
-						"type": "object",
-						"properties": map[string]any{
-							"command": map[string]any{
-								"type":        "string",
-								"description": "The shell command to execute",
-							},
-						},
-						"required": []string{"command"},
-					},
-				}),
-			},
-		},
-	)
-	return resp, err
 }
